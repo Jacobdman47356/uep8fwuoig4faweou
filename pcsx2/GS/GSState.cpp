@@ -2642,10 +2642,6 @@ __forceinline void GSState::HandleAutoFlush()
 	// So we need to calculate if a page boundary is being crossed for the format it is in and if the same part of the texture being written and read inside the draw.
 	if (PRIM->TME && (frame_hit || zbuf_hit) && GSUtil::HasSharedBits(frame_z_bp, frame_z_psm, m_context->TEX0.TBP0, m_context->TEX0.PSM))
 	{
-		const int page_mask_x = ~(GSLocalMemory::m_psm[m_context->TEX0.PSM].pgs.x - 1);
-		const int page_mask_y = ~(GSLocalMemory::m_psm[m_context->TEX0.PSM].pgs.y - 1);
-		const GSVector4i page_mask = { page_mask_x, page_mask_y, page_mask_x, page_mask_y };
-
 		size_t n = 1;
 
 		switch (GSUtil::GetPrimClass(PRIM->PRIM))
@@ -2662,6 +2658,13 @@ __forceinline void GSState::HandleAutoFlush()
 				break;
 		}
 
+		if ((m_vertex.tail - m_vertex.head) < (n - 1))
+			return;
+
+		const int page_mask_x = ~(GSLocalMemory::m_psm[m_context->TEX0.PSM].pgs.x - 1);
+		const int page_mask_y = ~(GSLocalMemory::m_psm[m_context->TEX0.PSM].pgs.y - 1);
+		const GSVector4i page_mask = { page_mask_x, page_mask_y, page_mask_x, page_mask_y };
+
 		GSVector4i tex_coord;
 		// Prepare the currently processed vertex.
 		if (PRIM->FST)
@@ -2676,14 +2679,14 @@ __forceinline void GSState::HandleAutoFlush()
 		}
 
 		GSVector4i tex_rect = tex_coord.xyxy();
-		GSVector4i next_rect = tex_rect;
-		const int current_tex_end = (int)(m_index.tail - (m_index.tail % n)) - 1;
+		
+		const int current_tex_end = (int)(m_vertex.tail - (m_vertex.tail % n))-1;
 		bool page_crossed = false;
 
 		// Check previous texture co-ordindates to see if we have changed page
-		for (int i = m_index.tail - 1; i >= current_tex_end; i--)
+		for (int i = m_vertex.tail - 1; i > current_tex_end; i--)
 		{
-			const GSVertex* v = &m_vertex.buff[m_index.buff[i]];
+			const GSVertex* v = &m_vertex.buff[i];
 
 			if (PRIM->FST)
 			{
@@ -2696,24 +2699,30 @@ __forceinline void GSState::HandleAutoFlush()
 				tex_coord.y = (int)((1 << m_context->TEX0.TH) * (v->ST.T / v->RGBAQ.Q));
 			}
 
-			next_rect.x = std::min(next_rect.x, tex_coord.x);
-			next_rect.z = std::max(next_rect.z, tex_coord.x);
-			next_rect.y = std::min(next_rect.y, tex_coord.y);
-			next_rect.w = std::max(next_rect.w, tex_coord.y);
-
-			const GSVector4i pages = next_rect & page_mask;
-
-			// We have changed page, so ignore the old textures co-ordinates.
-			if (!pages.xyxy().eq(pages.zwzw()))
-			{
-				page_crossed = true;
-				break;
-			}
-
-			tex_rect = next_rect;
+			tex_rect.x = std::min(tex_rect.x, tex_coord.x);
+			tex_rect.z = std::max(tex_rect.z, tex_coord.x);
+			tex_rect.y = std::min(tex_rect.y, tex_coord.y);
+			tex_rect.w = std::max(tex_rect.w, tex_coord.y);
 		}
 
-		tex_rect += GSVector4i(0, 0, 1, 1); // Intersect goes on space inside the rect
+		const GSVertex* v = &m_vertex.buff[m_index.buff[m_index.tail - 1]];
+
+		if (PRIM->FST)
+		{
+			tex_coord.x = v->U >> 4;
+			tex_coord.y = v->V >> 4;
+		}
+		else
+		{
+			tex_coord.x = (int)((1 << m_context->TEX0.TW) * (v->ST.S / v->RGBAQ.Q));
+			tex_coord.y = (int)((1 << m_context->TEX0.TH) * (v->ST.T / v->RGBAQ.Q));
+		}
+
+		const GSVector4i pages = tex_rect & page_mask;
+
+		tex_coord = tex_coord & page_mask;
+		if (!pages.xyzw().eq(tex_coord.xyxy()))
+			page_crossed = true;
 
 		if(page_crossed)
 		{
@@ -2725,7 +2734,7 @@ __forceinline void GSState::HandleAutoFlush()
 					m_vt.Update(m_vertex.buff, m_index.buff, m_vertex.tail - m_vertex.head, m_index.tail, GSUtil::GetPrimClass(PRIM->PRIM));
 
 				// Intersect goes on space inside the rect
-				GSVector4i area_out = GSVector4i(m_vt.m_min.p.xyxy(m_vt.m_max.p)) + GSVector4i(0, 0, 1, 1);
+				GSVector4i area_out = GSVector4i(m_vt.m_min.p.xyxy(m_vt.m_max.p));
 				// Scissor output
 				area_out = area_out.rintersect(GSVector4i(m_context->scissor.in));
 				// Intersect with texture
@@ -2734,7 +2743,6 @@ __forceinline void GSState::HandleAutoFlush()
 			}
 			else // Storage of the TEX and FRAME/Z is different, so uhh, just fall back to flushing each page. It's slower, sorry.
 			{
-				
 				if (m_context->FRAME.FBW == m_context->TEX0.TBW)
 				{
 					//We know we've changed page, so let's set the dimension to cover the page they're in (for different pixel orders)
@@ -2785,7 +2793,7 @@ __forceinline void GSState::VertexKick(u32 skip)
 			break;
 	}
 
-	if (auto_flush && m_index.tail >= n)
+	if (auto_flush && m_index.tail >= n && (m_vertex.tail > m_vertex.head) && !skip)
 		HandleAutoFlush();
 
 	ASSERT(m_vertex.tail < m_vertex.maxcount + 3);
